@@ -1,263 +1,170 @@
-
+import math
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from functools import partial
+
+import torch.nn.init as init
+
+from Metis.bitlinear import *
 
 
-class QuantFunc:
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor):
-        return x.abs().max() + 1e-6
-    
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        return x / s
-    
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
-        return x * s
-
-
-class WeightQuant(QuantFunc):
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, w, eps: float = 1e-6, bits = 1):
         
-        abs_mean = w.abs().mean()
-        abs_std  = w.abs().std()
+
+class MultiheadAttention(nn.Module):
+    def __init__(self, args) -> None:
+        super().__init__()
+        self.embed_dim = args.embed_dim
+        self.heads_num = args.heads
+        self.window_size = args.win_size
+        assert args.embed_dim % args.heads == 0, 'Embedding dimension must be divisible by number of heads.'
+
+        self.key = BitLinear(args.embed_dim, args.embed_dim, args=args)
+        self.query = BitLinear(args.embed_dim, args.embed_dim, args=args)
+        self.value = BitLinear(args.embed_dim, args.embed_dim, args=args)
+        self.proj = BitLinear(args.embed_dim, args.embed_dim, args=args)
+        # self.key = nn.Linear(embed_dim, embed_dim)
+        # self.query = nn.Linear(embed_dim, embed_dim)
+        # self.value = nn.Linear(embed_dim, embed_dim)
+        # self.proj = nn.Linear(embed_dim, embed_dim)
+
+        self.attn_dropout = nn.Dropout(args.dropout_prob)
+        self.proj_dropout = nn.Dropout(args.dropout_prob)
+        self.register_buffer('mask',
+            torch.tril(torch.ones(1, 1, self.window_size, self.window_size, device=args.device), diagonal=0)
+        )
+
+        self.mask_zero = torch.zeros(1, device=args.device)
+
+    def forward(self, x):
+        bs = x.size(0)
+        seq_len = x.size(1)
+
+        # x = [bs, seq_len, embed_dim]
+        k = self.key(x).view(bs, seq_len, self.heads_num, self.embed_dim // self.heads_num).transpose(1, 2)
+        q = self.query(x).view(bs, seq_len, self.heads_num, self.embed_dim // self.heads_num).transpose(1, 2)
+        v = self.value(x).view(bs, seq_len, self.heads_num, self.embed_dim // self.heads_num).transpose(1, 2)
+        # k, q, v = [bs, heads_num, seq_len, embed_dim // heads_num]
+
+        # [b, h, n, d] * [b, h, d, n] = [b, h, n, n]
+        attn = (torch.matmul(q, k.transpose(-2, -1))) / math.sqrt(self.embed_dim // self.heads_num)
+        mask = self.mask[:, :, :seq_len, :seq_len] #[1, 1, n, n]
+        attn = attn.masked_fill(mask == self.mask_zero, float('-inf')) 
+
+        # attn[b, 0, n] = q[b, 0, d] * k[b, d, n] * mask_fill
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_dropout(attn)
+
+        # [b, h, n, n] * [b, h, n, d] = [b, h, n, d]     x[b, 0, d] = attn[b, 0, n] * v[b, n, d]
+        x = torch.matmul(attn, v)
+        x = x.transpose(1, 2).contiguous().view(bs, seq_len, self.embed_dim)
+        x = self.proj(x)
+        x = self.proj_dropout(x)
+
+        return x
+
+
+class FeedForward(nn.Module):
+    def __init__(self, args) -> None:
+        super().__init__()
+        self.feed_fwd = nn.Sequential(
+            BitLinear(args.embed_dim, 4 * args.embed_dim, args=args),
+            nn.GELU(),
+            BitLinear(4 * args.embed_dim, args.embed_dim, args=args),
+            nn.Dropout(args.dropout_prob)
+        )
+
+    def forward(self, x):
+        return self.feed_fwd(x)
+
+
+class Decoder(nn.Module):
+    def __init__(self, args) -> None:
+        super().__init__()
+        self.ln1 = nn.LayerNorm(args.embed_dim, device=args.device)
+        self.ln2 = nn.LayerNorm(args.embed_dim, device=args.device)
+        self.attn = MultiheadAttention(args)
+        self.feed_fwd = FeedForward(args)
         
-        max_w = 2 * abs_std + eps
-        q_range = max_w / (2 ** bits)
-        w_quant = w / q_range
-        
-        w_quant = w_quant.round() / (2 ** bits)
-        w_quant = w_quant.clamp(-1, 1) * abs_mean
-    
-        return w_quant
+        self.get_attn_output_hook = lambda x, y, z: None
+        self.get_ffn_output_hook = lambda x, y, z: None
 
-class Cast2Fp4e2m1(QuantFunc):
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor):
-        return x.abs().max() / 6 + 1e-6
-    
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        x = x / s
-        levels = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.], dtype=x.dtype, device=x.device)
-        boundaries = (levels[:-1] + levels[1:]) / 2  
+    def forward(self, x):
+        if isinstance(x, tuple):
+            x, _ = x
+        x = self.get_attn_output(x)
+        x = self.get_ffn_output(x)
 
-        sign = torch.sign(x)                    
-        mag  = torch.abs(x)                     
-        idx  = torch.bucketize(mag, boundaries) 
-        qmag = levels[idx]                      
-        return sign * qmag 
-    
-class Cast2Fp4e2m1Random(QuantFunc):
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor):
-        return x.abs().max() / 6 + 1e-6
-    
-    
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x:torch.Tensor, s: torch.Tensor):
-        device = x.device
-        xsign = x.sign()
-        x = x.abs() / s
-        levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=device)
-
-        idx = torch.searchsorted(levels, x.clamp(min=levels.min(), max=levels.max()))
-        
-        left_idx = torch.clamp(idx - 1, 0, len(levels) - 1)
-        right_idx = torch.clamp(idx, 0, len(levels) - 1)
-        
-        left_val = levels[left_idx]
-        right_val = levels[right_idx]
-
-        mask_equal = (right_val == left_val)
-        out = torch.empty_like(x)
-
-        prob_right = (x - left_val) / (right_val - left_val + 1e-8) 
-        
-        rand = torch.rand_like(x)
-        choose_right = rand < prob_right
-
-        out[mask_equal] = left_val[mask_equal]
-        out[~mask_equal & choose_right] = right_val[~mask_equal & choose_right]
-        out[~mask_equal & ~choose_right] = left_val[~mask_equal & ~choose_right]
-
-        return out * xsign
-
-class Cast2Fp6e3m2(QuantFunc):
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor):
-        return x.abs().max() / 625 + 1e-7
-    
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        x1 = (x / s).clamp(-625, 625).abs()
-        x1 = (x1 ** (1 / 4)).to(torch.float8_e5m2).to(torch.float32)
-        x1 = x1 ** 4
-
-        return torch.sign(x) * x1
-
-class Cast2Fp8e4m3(QuantFunc):
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor):
-        return x.abs().max() / 448 + 1e-6
-    
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        return (x / s).to(dtype=torch.float8_e4m3fn).to(dtype=torch.float32)
-
-
-class Cast2Fp32(QuantFunc):
-    pass
-
-class BlockQuantFunc(QuantFunc):
-    block_shape = (1, 16)
-                
-    @classmethod
-    @torch.no_grad()
-    def _reshape(cls, x: torch.Tensor, s: torch.Tensor):
-        x = x.view(-1, x.shape[-1])
-        rows = x.shape[0]
-        cols = x.shape[1]
-        
-        brows = BlockQuantFunc.block_shape[0]
-        bcols = BlockQuantFunc.block_shape[1]
-        
-        s = s.view(rows // brows, 1, cols // bcols, 1)
-        x = x.view(rows // brows, brows, cols // bcols, bcols)
-        return x, s
-    
-
-class Cast2Fp4e2m1Block(BlockQuantFunc):
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor):
-        x = x.view(-1, x.shape[-1])
-        rows = x.shape[0]
-        cols = x.shape[1]
-        
-        brows = BlockQuantFunc.block_shape[0]
-        bcols = BlockQuantFunc.block_shape[1]
-        
-        assert(rows % brows == 0 and cols % bcols == 0)
-        
-        x = x.abs() \
-             .view(rows // brows, brows, cols // bcols, bcols) \
-             .amax(dim=(1, 3), keepdim=True) \
-             .view(rows // brows, cols // bcols) \
-             / 6 + 1e-9
-        
         return x
     
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        xshape = x.shape
-        x, s = BlockQuantFunc._reshape(x, s)
-        return Cast2Fp4e2m1Random.quant(x, s).view(xshape)
+    def get_attn_output(self, x):
+        if isinstance(x, tuple):
+            x, _ = x
+        attn_out = self.attn(x)
+        out = attn_out + x
+        self.get_attn_output_hook(attn_out, x, out)
+        return out
     
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
-        xshape = x.shape
-        x, s = BlockQuantFunc._reshape(x, s)
-        return Cast2Fp4e2m1Random.rquant(x, s).view(xshape)
+    def get_ffn_output(self, x):
+        ffn_out = self.get_ffn_output_wo_ln(x)
+        out = ffn_out + x
+        self.get_ffn_output_hook(ffn_out, x, out)
+        out = self.ln2(out)
+        return out
     
-class Cast2Fp6e3m2Block(BlockQuantFunc):
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor):
-        x = x.view(-1, x.shape[-1])
-        rows = x.shape[0]
-        cols = x.shape[1]
-        
-        brows = BlockQuantFunc.block_shape[0]
-        bcols = BlockQuantFunc.block_shape[1]
-        
-        assert(rows % brows == 0 and cols % bcols == 0)
-        
-        x = x.abs() \
-             .view(rows // brows, brows, cols // bcols, bcols) \
-             .amax(dim=(1, 3), keepdim=True) \
-             .view(rows // brows, cols // bcols) \
-             / 625 + 1e-7
-        
-        return x.to(dtype=torch.float16).to(dtype=torch.float32)
+    def get_ffn_output_wo_ln(self, x):
+        if isinstance(x, tuple):
+            x, _ = x
+        x = self.feed_fwd(x)
+        return x
     
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        xshape = x.shape
-        x, s = BlockQuantFunc._reshape(x, s)
-        return Cast2Fp6e3m2.quant(x, s).view(xshape)
-    
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
-        xshape = x.shape
-        x, s = BlockQuantFunc._reshape(x, s)
-        return Cast2Fp6e3m2.rquant(x, s).view(xshape)
+    def ffn_ln(self, x):
+        return self.ln2(x)
+
+class GPT(nn.Module):
+    def __init__(self, args) -> None:
+        super().__init__()
+        self.tok_emb = nn.Embedding(
+            args.vocab_size, 
+            args.embed_dim, 
+            padding_idx=args.vocab_size-1, 
+            device=args.device
+        )
+        self.pos_emb = nn.Parameter(torch.zeros(1, args.win_size, args.embed_dim).to(device=args.device))
+        self.dropout = nn.Dropout(args.dropout_prob)
+        self.decoders = nn.Sequential(*[Decoder(args) for _ in range(args.layers)])
+        self.ln = nn.LayerNorm(args.embed_dim, device=args.device)
+        self.fc = nn.Linear(args.embed_dim, args.vocab_size, bias=False, device=args.device)
 
 
-class Cast2Fp8e4m3Block(BlockQuantFunc):
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor):
-        x = x.view(-1, x.shape[-1])
-        rows = x.shape[0]
-        cols = x.shape[1]
-        
-        brows = BlockQuantFunc.block_shape[0]
-        bcols = BlockQuantFunc.block_shape[1]
-        
-        assert(rows % brows == 0 and cols % bcols == 0)
-        
-        x = x.abs() \
-             .view(rows // brows, brows, cols // bcols, bcols) \
-             .amax(dim=(1, 3), keepdim=True) \
-             .view(rows // brows, cols // bcols) \
-             / 448 + 1e-7
-        
-        return x.to(dtype=torch.float16).to(dtype=torch.float32)
-    
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        xshape = x.shape
-        x, s = BlockQuantFunc._reshape(x, s)
-        return Cast2Fp8e4m3.quant(x, s).view(xshape)
-    
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
-        xshape = x.shape
-        x, s = BlockQuantFunc._reshape(x, s)
-        return Cast2Fp8e4m3.rquant(x, s).view(xshape)
+    def forward(self, x):
+        x = self.get_decoder_output(x, len(self.decoders) - 1)
+        x = self.decode(x)
 
-@torch.no_grad()
-def cast_2_fp32(x):
-    return x
+        return x
 
-quant_func = {
-    "fp4e2m1": Cast2Fp4e2m1,
-    "fp4e2m1b": Cast2Fp4e2m1Block,
-    "fp6e3m2": Cast2Fp6e3m2,
-    "fp6e3m2b": Cast2Fp6e3m2Block,
-    "fp8e4m3": Cast2Fp8e4m3,
-    "fp8e4m3b": Cast2Fp8e4m3Block,
-    "fp32": Cast2Fp32,
-    "1p58bit": WeightQuant
-}
+    def get_decoder_output(self, x, i, prev = None):
+        if prev is None:
+            x = self.embed(x)
+            for j in range(i + 1):
+                x = self.decoders[j](x)
+            return x
+        else:
+            return self.decoders[i](prev)
+
+    def get_attn_output(self, x, layer):
+        x = self.get_decoder_output(x, layer - 1)
+        x = self.decoders[layer].get_attn_output(x)
+        return x
+
+    def decode(self, x):
+        x = self.fc(self.ln(x))
+        return x
+
+    def embed(self, x):
+        seq_len = x.size(1)
+        tok_x = self.tok_emb(x)
+        pos_emb = self.pos_emb[:, :seq_len, :]
+        x = self.dropout(tok_x) + pos_emb
+        return x
 
