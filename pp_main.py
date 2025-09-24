@@ -3,35 +3,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
-import numpy as np
-import torch.nn.functional as F
-import random
-import transformer_engine.pytorch as te
-
-
-
-from utils import get_dataset, Tokenized_data, log_sr
-
-from models import GPT, Transformer, TransformerSeq
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.nn.parallel.distributed import DistributedDataParallel as DDP
+from utils import Tokenized_data
+from models import TransformerSeq
+from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 from torch.utils.tensorboard import SummaryWriter
-
 from Metis import BitLinear
-
-import argparse
-
 from utils import parse
-from transformer_engine.common.recipe import Format, DelayedScaling
-
-import time
-
 from torchgpipe import GPipe
-import torchgpipe
-
 import torch.distributed as dist
-from torchgpipe.balance import balance_by_size
+
 
 def load_model(args):
     if args.local_rank >= 0:
@@ -41,6 +22,7 @@ def load_model(args):
 
     model = TransformerSeq(args).to(args.device)
 
+    # You need to change the balance here if you want to change the pp configuration or the model size.
     model = GPipe(model, balance=[8,9,9,9], chunks=min(args.grad_acc, 8))
     
     if args.load_from:
@@ -53,7 +35,6 @@ def load_model(args):
                 if isinstance(m, BitLinear):
                     m.split()
             model.load_state_dict(state_dict)
-            
             
         if args.local_rank == 0:
             print(f"model loaded from {args.load_from}")
@@ -79,8 +60,6 @@ def load_dataset(args):
     return dataloader
 
 def train(args):
-    fp8_format = Format.HYBRID  # E4M3 during forward pass, E5M2 during backward pass
-    fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max")
     if args.local_rank <= 0:
         writer = SummaryWriter(f"{args.log_dir}/{args.tag}")
 
@@ -111,37 +90,31 @@ def train(args):
             if acc_steps == 1:
                 optimizer.zero_grad()
 
-            with te.fp8_autocast(enabled=args.enable_te, fp8_recipe=fp8_recipe):
-            # with torch.amp.autocast(f"cuda", dtype=torch.bfloat16):
-                if args.model == "gpt":
-                    output = model(source)
-                    loss = loss_fn(output.view(-1, args.vocab_size), target.view(-1)) / args.grad_acc
-                else:
-                    logit = model(source)
-                    loss = loss_fn(logit.view(-1, args.vocab_size), target.view(-1)) / args.grad_acc
-                    # loss /= args.grad_acc
-                acc_loss += loss.item()
             
-                if acc_steps == args.grad_acc:
-                    if args.local_rank <= 0:
-                        writer.add_scalar("train_loss", acc_loss, train_steps)
-                    
-                    # regularization
-                    rloss = torch.zeros_like(loss)
-                    if args.reg_lambda > 0:
-                        for name, p in model.decoders.named_parameters():
-                            if ("ulinear" in name or "vlinear" in name or (not ("ln" in name))) and "weight" in name:
-                                rloss += (torch.sum(p ** 2) * args.reg_alpha1 + \
-                                        torch.sum(((p + 1e-6) ** -2) * args.reg_alpha2)) * \
-                                        (1 / p.shape[0] / p.shape[1] * args.reg_lambda) 
-                    loss += rloss
-                    loss.backward()
-                    
-                else:
-                    print(loss)
-                    loss.backward()
-                    acc_steps += 1
-                    continue
+            logit = model(source)
+            loss = loss_fn(logit.view(-1, args.vocab_size), target.view(-1)) / args.grad_acc
+            acc_loss += loss.item()
+        
+            if acc_steps == args.grad_acc:
+                if args.local_rank <= 0:
+                    writer.add_scalar("train_loss", acc_loss, train_steps)
+                
+                # regularization
+                rloss = torch.zeros_like(loss)
+                if args.reg_lambda > 0:
+                    for name, p in model.decoders.named_parameters():
+                        if ("ulinear" in name or "vlinear" in name or (not ("ln" in name))) and "weight" in name:
+                            rloss += (torch.sum(p ** 2) * args.reg_alpha1 + \
+                                    torch.sum(((p + 1e-6) ** -2) * args.reg_alpha2)) * \
+                                    (1 / p.shape[0] / p.shape[1] * args.reg_lambda) 
+                loss += rloss
+                loss.backward()
+                
+            else:
+                print(loss)
+                loss.backward()
+                acc_steps += 1
+                continue
             
 
             if args.local_rank <= 0:
@@ -151,7 +124,6 @@ def train(args):
                     f"loss: {acc_loss:.3f}, "
                     f"r-loss: {rloss.item() + acc_loss:.3f}"
                     )
-            # f"grad_norm: {g}"
             
             g = 0
             for name, p in model.named_parameters():
@@ -164,7 +136,6 @@ def train(args):
 
             optimizer.step()
             lr_scheduler.step()
-            
             
             torch.cuda.synchronize() 
 

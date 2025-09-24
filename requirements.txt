@@ -1,0 +1,9 @@
+torch
+transformer_engine>=2.0.0
+numpy
+transformers
+scipy
+torchgpipe
+pandas
+matplotlib
+tiktoken

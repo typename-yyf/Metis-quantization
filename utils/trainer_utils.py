@@ -92,6 +92,7 @@ def parse():
     parser.add_argument("--log-dir", type=str)
     parser.add_argument("--chkpt-dir", type=str)
     parser.add_argument("--dataset-path", type=str)
+    parser.add_argument("--tokenizer-path", type=str)
     parser.add_argument("--device", type=int)
     parser.add_argument("--tag", type=str)
     parser.add_argument("--batch-size", type=int, default=20)

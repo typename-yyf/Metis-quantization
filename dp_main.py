@@ -1,34 +1,18 @@
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
-import numpy as np
-import torch.nn.functional as F
-import random
 import transformer_engine.pytorch as te
 
-
-
-from utils import get_dataset, Tokenized_data, log_sr
-
-from models import GPT, Transformer
-from torch.utils.data import DataLoader, DistributedSampler
+from utils import Tokenized_data
+from models import GPT
+from torch.utils.data import DataLoader
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from transformers import get_linear_schedule_with_warmup
 from torch.utils.tensorboard import SummaryWriter
-
 from Metis import BitLinear
-
-import argparse
-
 from utils import parse
 from transformer_engine.common.recipe import Format, DelayedScaling
-
-import time
-
-# from torchgpipe import GPipe
-
 import torch.distributed as dist
 
 def load_model(args):
@@ -75,8 +59,6 @@ def load_dataset(args):
     return dataloader
 
 def train(args):
-    fp8_format = Format.HYBRID  # E4M3 during forward pass, E5M2 during backward pass
-    fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max")
     if args.local_rank <= 0:
         writer = SummaryWriter(f"{args.log_dir}/{args.tag}")
 
@@ -99,12 +81,10 @@ def train(args):
     acc_steps = 1
     acc_loss = 0
     
-    for epoch in range(args.max_epochs):     
+    for epoch in range(args.max_epochs):   
+          
         for batch, (source, target, _) in enumerate(dataloader):
-            
-            # merge and split
 
-            
             if args.enable_forward_svd and batch >= args.forward_svd_warmup_steps and acc_steps == 1:
                 if batch == args.forward_svd_warmup_steps or \
                    (args.forward_svd_merge_steps > 0 and (batch - args.forward_svd_warmup_steps) % args.forward_svd_merge_steps == 0):
@@ -122,43 +102,38 @@ def train(args):
                     )  
                     lr_scheduler = get_linear_schedule_with_warmup(optimizer, args.lr_warmup_steps, args.train_steps)
             
-            # # ====== 前向传播计时 ======
-            # torch.cuda.empty_cache(
-            
             source, target = source.to(args.device), target.to(args.device)
             
             if acc_steps == 1:
                 optimizer.zero_grad()
 
-            with te.fp8_autocast(enabled=args.enable_te, fp8_recipe=fp8_recipe):
-            # with torch.amp.autocast(f"cuda", dtype=torch.bfloat16):
-                if args.model == "gpt":
-                    output = model(source)
-                    loss = loss_fn(output.view(-1, args.vocab_size), target.view(-1)) / args.grad_acc
-                else:
-                    output, loss = model(source, targets=target)
-                    loss /= args.grad_acc
-                acc_loss += loss.item()
-            
-                if acc_steps == args.grad_acc:
-                    if args.local_rank <= 0:
-                        writer.add_scalar("train_loss", acc_loss, train_steps)
-                    
-                    # regularization dp only
-                    rloss = torch.zeros_like(loss)
-                    if args.reg_lambda > 0:
-                        for name, p in model.decoders.named_parameters():
-                            if ("ulinear" in name or "vlinear" in name or (not ("ln" in name))) and "weight" in name:
-                                rloss += (torch.sum(p ** 2) * args.reg_alpha1 + \
-                                        torch.sum(((p + 1e-6) ** -2) * args.reg_alpha2)) * \
-                                        (1 / p.shape[0] / p.shape[1] * args.reg_lambda) 
-                    loss += rloss
-                    loss.backward()
-                    
-                else:
-                    loss.backward()
-                    acc_steps += 1
-                    continue
+            if args.model == "gpt":
+                output = model(source)
+                loss = loss_fn(output.view(-1, args.vocab_size), target.view(-1)) / args.grad_acc
+            else:
+                output, loss = model(source, targets=target)
+                loss /= args.grad_acc
+            acc_loss += loss.item()
+        
+            if acc_steps == args.grad_acc:
+                if args.local_rank <= 0:
+                    writer.add_scalar("train_loss", acc_loss, train_steps)
+                
+                # regularization dp only
+                rloss = torch.zeros_like(loss)
+                if args.reg_lambda > 0:
+                    for name, p in model.decoders.named_parameters():
+                        if ("ulinear" in name or "vlinear" in name or (not ("ln" in name))) and "weight" in name:
+                            rloss += (torch.sum(p ** 2) * args.reg_alpha1 + \
+                                    torch.sum(((p + 1e-6) ** -2) * args.reg_alpha2)) * \
+                                    (1 / p.shape[0] / p.shape[1] * args.reg_lambda) 
+                loss += rloss
+                loss.backward()
+                
+            else:
+                loss.backward()
+                acc_steps += 1
+                continue
             
 
             if args.local_rank <= 0:
@@ -193,7 +168,6 @@ def train(args):
             acc_steps = 1
             train_steps += 1
             if args.train_steps == batch + 1:
-                
                 break
 
 

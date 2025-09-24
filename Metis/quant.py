@@ -45,21 +45,14 @@ class Cast2Fp4e2m1(QuantFunc):
     @classmethod
     @torch.no_grad()
     def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        # sx1 = (x / (s + 1e-5) * 2).abs().sqrt().round() * (torch.sign(x))
-        # # print(sx1.max())
-        # x1 = (x / (s + 1e-5) * 2 / (sx1 + 1e-5)).round() * sx1 / 2
-        # # print(x1.max())
-        # return x1
+        xsign = x.sign()
+        x = x.abs() / (s / 2)
         
-        x = x / s
-        levels = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.], dtype=x.dtype, device=x.device)
-        boundaries = (levels[:-1] + levels[1:]) / 2  
-
-        sign = torch.sign(x)                    
-        mag  = torch.abs(x)                     
-        idx  = torch.bucketize(mag, boundaries) 
-        qmag = levels[idx]                      
-        return sign * qmag 
+        
+        x -= (x - 4).relu_() / 2 + (x - 8).relu_() / 4
+        x.round_()
+        x += (x - 4).relu_() + (x - 6).relu_() * 2      
+        return x * xsign / 2
     
 class Cast2Fp4e2m1Random(QuantFunc):
     @classmethod
@@ -71,33 +64,15 @@ class Cast2Fp4e2m1Random(QuantFunc):
     @classmethod
     @torch.no_grad()
     def quant(cls, x:torch.Tensor, s: torch.Tensor):
-        device = x.device
         xsign = x.sign()
-        x = x.abs() / s
-        levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=device)
-
-        idx = torch.searchsorted(levels, x.clamp(min=levels.min(), max=levels.max()))
+        x = x.abs() / (s / 2)
         
-        left_idx = torch.clamp(idx - 1, 0, len(levels) - 1)
-        right_idx = torch.clamp(idx, 0, len(levels) - 1)
-        
-        left_val = levels[left_idx]
-        right_val = levels[right_idx]
-
-        mask_equal = (right_val == left_val)
-        out = torch.empty_like(x)
-
-        prob_right = (x - left_val) / (right_val - left_val + 1e-8)  # 在 [0,1]
-        prob_left = 1.0 - prob_right
-        
-        rand = torch.rand_like(x)
-        choose_right = rand < prob_right
-
-        out[mask_equal] = left_val[mask_equal]
-        out[~mask_equal & choose_right] = right_val[~mask_equal & choose_right]
-        out[~mask_equal & ~choose_right] = left_val[~mask_equal & ~choose_right]
-
-        return out * xsign
+        x -= (x - 4).relu_() / 2 + (x - 8).relu_() / 4
+        x += torch.rand_like(x) - 0.5
+        x.round_()
+        x += (x - 4).relu_() + (x - 6).relu_() * 2      
+        return x * xsign / 2
+        # return out * xsign
 
 class Cast2Fp6e3m2(QuantFunc):
     @classmethod
@@ -111,7 +86,7 @@ class Cast2Fp6e3m2(QuantFunc):
         x1 = (x / s).clamp(-625, 625).abs()
         x1 = (x1 ** (1 / 4)).to(torch.float8_e5m2).to(torch.float32)
         x1 = x1 ** 4
-        # print(x1.max(), x1.argmax(keepdim=True), s.argmax(keepdim=True))
+
         return torch.sign(x) * x1
 
 class Cast2Fp8e4m3(QuantFunc):
@@ -135,7 +110,7 @@ class BlockQuantFunc(QuantFunc):
     @classmethod
     @torch.no_grad()
     def _reshape(cls, x: torch.Tensor, s: torch.Tensor):
-        x = x.view(-1, x.shape[-1])
+        x = x.reshape(-1, x.shape[-1])
         rows = x.shape[0]
         cols = x.shape[1]
         
@@ -151,7 +126,7 @@ class Cast2Fp4e2m1Block(BlockQuantFunc):
     @classmethod
     @torch.no_grad()
     def get_scalar(cls, x: torch.Tensor):
-        x = x.view(-1, x.shape[-1])
+        x = x.reshape(-1, x.shape[-1])
         rows = x.shape[0]
         cols = x.shape[1]
         
@@ -166,7 +141,7 @@ class Cast2Fp4e2m1Block(BlockQuantFunc):
              .view(rows // brows, cols // bcols) \
              / 6 + 1e-9
         
-        return x.to(dtype=torch.float32)
+        return x
     
     @classmethod
     @torch.no_grad()
@@ -217,8 +192,6 @@ class Cast2Fp6e3m2Block(BlockQuantFunc):
         x, s = BlockQuantFunc._reshape(x, s)
         return Cast2Fp6e3m2.rquant(x, s).view(xshape)
 
-# @torch.no_grad()
-# def weight_quant(w: torch.Tensor, eps: float = 1e-6, bits = 1):
 
 class Cast2Fp8e4m3Block(BlockQuantFunc):
     @classmethod
@@ -259,13 +232,14 @@ class Cast2Fp8e4m3Block(BlockQuantFunc):
 def cast_2_fp32(x):
     return x
 
+
 quant_func = {
     "fp4e2m1": Cast2Fp4e2m1,
     "fp4e2m1b": Cast2Fp4e2m1Block,
     "fp6e3m2": Cast2Fp6e3m2,
     "fp6e3m2b": Cast2Fp6e3m2Block,
-    "fp8e4m3": Cast2Fp6e3m2,
-    "fp8e4m3b": Cast2Fp6e3m2Block,
+    "fp8e4m3": Cast2Fp8e4m3,
+    "fp8e4m3b": Cast2Fp8e4m3Block,
     "fp32": Cast2Fp32,
-    "1p58bit": WeightQuant
+    "1p58bit": WeightQuant,
 }
