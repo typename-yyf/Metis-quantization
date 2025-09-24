@@ -9,7 +9,7 @@ The implementation details of Metis can be found in ```Metis/bitlinear.py```.
 You can train the example GPT-2 model by running the following command:
 
 ```bash
-bash run.sh
+bash train-gpt-2.sh
 ````
 
 **Metis Arguments**
