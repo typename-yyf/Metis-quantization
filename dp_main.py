@@ -15,6 +15,8 @@ from utils import parse
 from transformer_engine.common.recipe import Format, DelayedScaling
 import torch.distributed as dist
 
+from opti import NewMuon
+
 def load_model(args):
     if args.local_rank >= 0:
         torch.cuda.set_device(args.local_rank)
@@ -58,6 +60,60 @@ def load_dataset(args):
 
     return dataloader
 
+
+def print_model_structure(model, show_parameters=True):
+    """
+    打印 model 的层级结构、module 类型、参数数量（总/训练）以及 module 名称（带缩进体现层级）
+    """
+    def num_params(module):
+        total = sum(p.numel() for p in module.parameters(recurse=False))
+        trainable = sum(p.numel() for p in module.parameters(recurse=False) if p.requires_grad)
+        return total, trainable
+
+    for name, module in model.named_modules():
+        # 计算缩进等级（模块名按 '.' 分层）
+        indent = "  " * (0 if name == "" else name.count(".") + 1)
+        t_total, t_train = num_params(module)
+        if show_parameters:
+            print(f"{indent}{name or '<root>'}: {module.__class__.__name__}  | params (this module only): total={t_total}, trainable={t_train}")
+        else:
+            print(f"{indent}{name or '<root>'}: {module.__class__.__name__}")
+
+def get_optimizer(args, model):
+    if args.optimizer_name == "adamw":
+        return optim.AdamW(
+            model.parameters(), 
+            lr=args.lr, 
+            betas=(args.adam_beta1, args.adam_beta2), 
+            eps=1e-8, 
+            weight_decay=args.weight_decay
+        ) 
+    elif args.optimizer_name == "newmuon":
+        print_model_structure(model)
+        muon_params = [
+            p
+            for name, p in model.named_parameters()
+            if p.ndim >= 2 and "emb" not in name and "fc" not in name
+        ]
+        adamw_params = [
+            p
+            for name, p in model.named_parameters()
+            if not (
+                p.ndim >= 2 and "emb" not in name and "fc" not in name
+            )
+        ]
+
+        return NewMuon(
+            lr=args.lr,
+            wd=args.weight_decay,
+            muon_params=muon_params,
+            adamw_params=adamw_params,
+            adamw_betas=(args.adam_beta1, args.adam_beta2)
+        )
+    else:
+        assert 0, "optimizer not supported"
+        
+
 def train(args):
     if args.local_rank <= 0:
         writer = SummaryWriter(f"{args.log_dir}/{args.tag}")
@@ -68,13 +124,7 @@ def train(args):
     model.train()
 
     loss_fn = nn.CrossEntropyLoss(ignore_index = args.vocab_size - 1)
-    optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=args.lr, 
-        betas=(args.adam_beta1, args.adam_beta2), 
-        eps=1e-8, 
-        weight_decay=args.weight_decay
-    )  
+    optimizer = get_optimizer(args, model) 
     lr_scheduler = get_linear_schedule_with_warmup(optimizer, args.lr_warmup_steps, args.train_steps)
 
     train_steps = 0

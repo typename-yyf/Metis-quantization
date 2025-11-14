@@ -39,6 +39,7 @@ python -m torch.distributed.launch --nproc_per_node $NPROC --master-port $PORT d
     --enable-backward-svd \
     --backward-lowrank-svd 60 \
     --backward-lowrank-niter 0 \
+    --optimizer_name adamw
 
 
 
